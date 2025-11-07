@@ -1,0 +1,377 @@
+# ========================================================================
+# 滑动窗口回归分析代码 (R)
+# ========================================================================
+
+# 1. 加载必要的R包
+library(readr)
+library(dplyr)
+library(tidyr) 
+library(stringr) 
+library(readxl)
+library(purrr)
+library(broom)
+library(tools) 
+library(lubridate) 
+
+# --- 【用户参数设定】 ---
+# 2. 定义路径 
+parent_dir <- "Youth Path" 
+input_landcover_dir <- file.path(parent_dir, "实例") 
+output_dir <- file.path(parent_dir, "kRSEI综合") 
+
+# 完整的路径定义 (基于 output_dir 的拼接)
+input_regional_file <- file.path(output_dir, "KRSEI综合_月.xlsx") 
+input_area_prop_file <- file.path(output_dir, "Landcover_Area_Proportion_Annual.csv")
+
+# 3. 滑动窗口参数
+window_size <- 9    # 窗口大小 n=9 个月 (3月到11月)
+lag_n <- 9          # 季节差分阶数 n=9 (对应 3月到11月的年周期)
+alpha <- 0.05       # 显著性水平
+
+# 4. 地类编码映射
+landcover_codes <- c(
+    "GPKG_1" = "Cropland", "GPKG_2" = "Forest", "GPKG_3" = "Shrub", 
+    "GPKG_4" = "Grassland", "GPKG_7" = "Barren", "GPKG_8" = "Impervious"
+)
+
+# 5. 确保输出目录存在
+if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+}
+
+# ------------------------------------------------------------------------
+
+## 步骤一：读取、合并并重塑地类 KRSEI 数据
+
+cat("--- 步骤一：读取地类 KRSEI 文件并转换为长格式 ---\n")
+
+landcover_files <- list.files(path = input_landcover_dir, pattern = "Monthly_AllGPKG_Aligned_Reshaped\\.csv$", full.names = TRUE)
+if (length(landcover_files) == 0) stop("错误: 未找到地类文件。")
+
+landcover_data_final <- landcover_files %>%
+    map_df(~{
+        df <- read_csv(.x, show_col_types = FALSE)
+        
+        df %>%
+            rename(Time_Node_Raw = 1) %>% 
+            mutate(
+                Time_Node = format(parse_date_time(Time_Node_Raw, orders = c("Ymd", "Y/m/d", "Y-m-d", "Y_m", "Ym")), "%Y_%m")
+            ) %>%
+            select(-Time_Node_Raw) %>%
+            
+            pivot_longer(
+                cols = matches("^Shanshui_GPKG_\\d+_Shanshui_\\d{2}$"), names_to = "Group_Landcover", values_to = "Landcover_KRSEI" 
+            ) %>%
+            mutate(
+                # 保持 Landcover_KRSEI 的 NA 赋值为 0 
+                Landcover_KRSEI = replace_na(Landcover_KRSEI, 0), 
+                GPKG_ID = str_extract(Group_Landcover, "GPKG_\\d+"),
+                Shanshui_Group = str_extract(Group_Landcover, "Shanshui_\\d{2}$")
+            ) %>%
+            filter(GPKG_ID %in% names(landcover_codes) & !is.na(Shanshui_Group)) %>%
+            mutate(Landcover_Name = recode(GPKG_ID, !!!landcover_codes)) %>%
+            select(Time_Node, Shanshui_Group, Landcover_Name, Landcover_KRSEI)
+    })
+
+
+## 步骤二：读取区域 KRSEI 数据
+
+cat("--- 步骤二：读取区域 KRSEI 数据 ---\n")
+
+regional_data_raw <- tryCatch({
+    read_excel(input_regional_file)
+}, error = function(e) {
+    stop(paste0("FATAL ERROR: 无法读取区域文件。请确认文件路径 '", input_regional_file, "' 是正确的。\n原始错误: ", e$message))
+})
+
+regional_data <- regional_data_raw %>%
+    rename(Time_Node_Raw = 1) %>% 
+    mutate(
+        Time_Node = format(Time_Node_Raw, "%Y_%m")
+    ) %>%
+    filter(!is.na(Time_Node) & Time_Node != "NA_NA") %>% 
+    select(-Time_Node_Raw) %>%
+    
+    pivot_longer(cols = -Time_Node, names_to = "Shanshui_Group_Full", values_to = "Regional_KRSEI") %>%
+    mutate(
+        Shanshui_Group = str_replace(str_extract(Shanshui_Group_Full, "shanshui_\\d{2}"), "shanshui", "Shanshui"), 
+        # 保持 Regional_KRSEI 的 NA 赋值为 0 
+        Regional_KRSEI = replace_na(Regional_KRSEI, 0)
+    ) %>%
+    filter(!is.na(Shanshui_Group)) %>%
+    select(Time_Node, Shanshui_Group, Regional_KRSEI)
+
+
+## 步骤三：KRSEI 数据合并、筛选、排序
+
+cat("--- 步骤三：合并 KRSEI 数据、筛选生长季 (3月-11月) ---\n")
+
+master_data <- landcover_data_final %>%
+    inner_join(regional_data, by = c("Time_Node", "Shanshui_Group")) %>%
+    mutate(
+        Regression_ID = paste(Shanshui_Group, Landcover_Name, sep = "_"),
+        Year = as.integer(str_extract(Time_Node, "\\d{4}")),
+        Month = as.integer(str_extract(Time_Node, "\\d{2}$")),
+        Time_Value = Year * 100 + Month 
+    )
+
+master_data <- master_data %>%
+    filter(Month >= 3 & Month <= 11) %>% # 筛选生长季
+    arrange(Regression_ID, Time_Value) 
+    
+if (nrow(master_data) == 0) {
+    stop("致命错误：KRSEI 主数据表行数为 0。请检查输入文件。")
+}
+
+# ---
+## 步骤 3.5：【新增】对 KRSEI 序列进行季节差分 (n=9 阶)
+cat("\n--- 步骤 3.5：消除月度 KRSEI 数据的季节性 (n=9 阶差分) ---\n")
+
+master_data <- master_data %>%
+    group_by(Regression_ID) %>%
+    mutate(
+        # 季节差分：当前值 - 去年同期值 (n=9 对应于 3-11 月的周期)
+        Landcover_KRSEI_Diff = Landcover_KRSEI - lag(Landcover_KRSEI, n = lag_n),
+        Regional_KRSEI_Diff = Regional_KRSEI - lag(Regional_KRSEI, n = lag_n)
+    ) %>%
+    ungroup() %>%
+    # 删除差分产生的 NA 值 (即第一年的数据)
+    filter(!is.na(Landcover_KRSEI_Diff) & !is.na(Regional_KRSEI_Diff)) %>%
+    
+    # 替换原始变量，用于后续步骤
+    rename(
+        Landcover_KRSEI_Raw = Landcover_KRSEI,
+        Regional_KRSEI_Raw = Regional_KRSEI
+    ) %>%
+    rename(
+        Landcover_KRSEI = Landcover_KRSEI_Diff,
+        Regional_KRSEI = Regional_KRSEI_Diff
+    )
+
+cat(paste0("[CHECK] 差分后总行数: ", nrow(master_data), "。第一年数据已用于差分，已被移除。\n"))
+# ---
+
+## 步骤 3.6：读取土地利用面积占比并合并 (步骤编号调整)
+
+cat("\n--- 步骤 3.6：读取土地利用面积占比并按年合并 ---\n")
+
+# A. 读取面积占比数据
+landarea_proportion_annual <- tryCatch({
+    read_csv(input_area_prop_file, show_col_types = FALSE)
+}, error = function(e) {
+    stop(paste0("FATAL ERROR: 无法读取面积占比文件。请先运行面积占比计算代码，并确认路径:\n", input_area_prop_file))
+})
+
+# B. 合并数据：按 Shanshui_Group, Year, Landcover_Name 进行匹配
+master_data_merged <- master_data %>%
+    inner_join(
+        landarea_proportion_annual %>% select(Shanshui_Group, Year, Landcover_Name, Area_Proportion),
+        by = c("Shanshui_Group", "Year", "Landcover_Name")
+    ) %>%
+    # C. 核心修正：计算 Weighted_KRSEI = Landcover_KRSEI_Diff × Area_Proportion
+    # 注意：Landcover_KRSEI 已是差分后的值
+    mutate(
+        Weighted_KRSEI = Landcover_KRSEI * Area_Proportion
+    ) %>%
+    # 合并和计算完成后，去除不再需要的 Year 和 Month 列
+    select(-Year, -Month) 
+
+# 覆盖旧的 master_data 变量，供步骤四使用
+master_data <- master_data_merged
+
+# 输出用于检查的合并后的数据表
+master_output_merged_path <- file.path(output_dir, "KRSEI_Master_Data_Diff_Merged.csv")  
+write_csv(master_data %>% select(-Time_Value), master_output_merged_path) 
+
+cat(paste0("[SUCCESS] 1/7 最终合并的主数据表 (差分后) 已保存至: ", master_output_merged_path, "\n"))
+cat(paste0("[CHECK] 合并面积后的总行数: ", nrow(master_data), "。\n"))
+
+# ------------------------------------------------------------------------
+
+## 步骤四：滑动窗口回归计算 (基于 Weighted_KRSEI_Diff 的单变量模型)
+
+cat("\n--- 步骤四：执行滑动窗口回归计算 (基于差分序列的单变量模型) ---\n")
+
+# 4.1 过滤掉长度不足的序列
+group_counts <- master_data %>% count(Regression_ID, name = "count")
+skipped_groups_length <- group_counts %>% filter(count < window_size) %>% pull(Regression_ID)
+
+nested_data <- master_data %>%
+    filter(!Regression_ID %in% skipped_groups_length) %>%
+    group_by(Regression_ID) %>%
+    nest() 
+
+# 4.2 定义滑动回归函数 (自变量为 Weighted_KRSEI_Diff，因变量为 Regional_KRSEI_Diff)
+run_rolling_regression <- function(df) {
+    
+    K_local <- nrow(df) - window_size + 1
+    if (K_local < 1) { return(NULL) }
+
+    results <- map(1:K_local, ~{ 
+        
+        window_data <- df[.x:(.x + window_size - 1), ]
+        Window_Time_Node <- window_data$Time_Node[window_size] 
+        
+        # 1. 检查零方差 (针对 Weighted_KRSEI_Diff)
+        if (var(window_data$Weighted_KRSEI, na.rm = TRUE) < 1e-10) {
+            return(tibble(Time_Node = Window_Time_Node, beta = NA_real_, p_value = NA_real_, R_value_All = NA_real_, status = "Failed_Zero_Var_Weighted"))
+        }
+        
+        # 2. 运行回归模型 (Regional_KRSEI_Diff ~ Weighted_KRSEI_Diff)
+        model <- tryCatch(
+            lm(Regional_KRSEI ~ Weighted_KRSEI, data = window_data),
+            error = function(e) {
+                return(tibble(Time_Node = Window_Time_Node, beta = NA_real_, p_value = NA_real_, R_value_All = NA_real_, status = "Failed_Other"))
+            }
+        )
+        
+        if (inherits(model, "tbl_df")) { return(model) }
+
+        # 3. 提取结果 
+        tidy_model <- tidy(model)
+        glance_model <- glance(model)
+        
+        beta_row <- tidy_model %>% filter(term == "Weighted_KRSEI")
+        
+        # 结果指标：Adjusted R² 
+        adj_R2 <- glance_model$adj.r.squared
+        
+        tibble(
+            Time_Node = Window_Time_Node,
+            beta = beta_row$estimate[1],
+            p_value = beta_row$p.value[1],
+            R_value_All = adj_R2, # 存储 Adjusted R²
+            status = "Success"
+        )
+    })
+    
+    results %>% compact() %>% list_rbind()
+}
+
+# 4.3 对所有分组执行滑动窗口回归
+regression_results_raw <- nested_data %>%
+    mutate(
+        rolling_reg_output = map(data, run_rolling_regression)
+    ) %>%
+    rowwise() %>% 
+    mutate(
+        rolling_reg_output = list(if (is.null(rolling_reg_output)) tibble() else rolling_reg_output)
+    ) %>%
+    ungroup() %>%
+    select(-data) %>%
+    unnest(rolling_reg_output) %>% 
+    separate(Regression_ID, into = c("Shanshui_Group", "Landcover_Name"), sep = "_", extra = "merge")
+
+# 4.4 显著性检验和最终序列生成
+final_results <- regression_results_raw %>%
+    filter(!is.na(Time_Node) | status == "Failed_Zero_Var_Weighted" | status == "Failed_Other") %>% 
+    select(-status) %>% 
+    mutate(
+        # 1. 计算显著性 (针对 Beta / P 值)
+        is_significant = ifelse(!is.na(p_value) & p_value < alpha, TRUE, FALSE),
+        
+        # 2. R 值 (即 Adjusted R²)：只保留显著 Beta 对应的 Adjusted R²
+        Final_R_Significant = ifelse(is_significant, R_value_All, NA_real_), 
+        
+        # 3. Beta 值：只保留显著的 Beta 值
+        Final_Beta_Significant = ifelse(is_significant, beta, NA_real_)
+    ) %>%
+    # 选择所有需要的输出列
+    select(Time_Node, Shanshui_Group, Landcover_Name, R_value_All, Final_R_Significant, beta, Final_Beta_Significant, p_value, is_significant) %>%
+    arrange(Shanshui_Group, Landcover_Name, Time_Node)
+
+
+## 步骤五：最终重塑和保存（5个结果序列文件）
+
+cat("\n--- 步骤五：最终重塑和保存 ( Adjusted R² 和 Beta 值) ---\n")
+
+all_time_nodes <- final_results %>%
+    filter(!is.na(Time_Node)) %>% 
+    distinct(Time_Node) %>%
+    arrange(Time_Node)
+
+if(nrow(all_time_nodes) == 0) {
+    cat("[WARNING] 没有成功计算出任何一个时间点（Time_Node）。输出文件将为空。\n")
+    return(invisible(NULL))
+}
+
+# 3. R 序列 (所有 Adjusted R² 值)
+final_output_R_all_wide <- final_results %>%
+    mutate(New_Col_Name = paste(Shanshui_Group, Landcover_Name, sep = "_")) %>%
+    select(Time_Node, New_Col_Name, R_value_All) %>% 
+    right_join(all_time_nodes, by = "Time_Node") %>%
+    pivot_wider(
+        id_cols = Time_Node, names_from = New_Col_Name, values_from = R_value_All, values_fn = max 
+    ) %>%
+    arrange(Time_Node)
+
+# 文件名改为 Adjusted_R_Series_All
+final_output_R_all_path <- file.path(output_dir, "Rolling_Regression_Adjusted_R_Series_All_Diff.csv") # 增加 Diff 标识
+write_csv(final_output_R_all_wide, final_output_R_all_path)
+cat(paste0("[SUCCESS] 3/7 滑动窗口 Adjusted R² (所有值, 差分) 序列已保存至: ", final_output_R_all_path, "\n"))
+
+
+# 4. R 序列 (显著 Adjusted R² 值)
+final_output_R_sig_wide <- final_results %>%
+    mutate(New_Col_Name = paste(Shanshui_Group, Landcover_Name, sep = "_")) %>%
+    select(Time_Node, New_Col_Name, Final_R_Significant) %>% 
+    right_join(all_time_nodes, by = "Time_Node") %>%
+    pivot_wider(
+        id_cols = Time_Node, names_from = New_Col_Name, values_from = Final_R_Significant, values_fn = max 
+    ) %>%
+    arrange(Time_Node)
+
+# 文件名改为 Adjusted_R_Series_Significant
+final_output_R_sig_path <- file.path(output_dir, "Rolling_Regression_Adjusted_R_Series_Significant_Diff.csv") # 增加 Diff 标识
+write_csv(final_output_R_sig_wide, final_output_R_sig_path)
+cat(paste0("[SUCCESS] 4/7 滑动窗口 Adjusted R² (显著, 差分) 序列已保存至: ", final_output_R_sig_path, "\n"))
+
+
+# 5. Beta 序列 (所有 Beta 值) - 针对 Weighted_KRSEI_Diff
+final_output_beta_all_wide <- final_results %>%
+    mutate(New_Col_Name = paste(Shanshui_Group, Landcover_Name, sep = "_")) %>%
+    select(Time_Node, New_Col_Name, beta) %>%
+    right_join(all_time_nodes, by = "Time_Node") %>%
+    pivot_wider(
+        id_cols = Time_Node, names_from = New_Col_Name, values_from = beta, values_fn = max
+    ) %>%
+    arrange(Time_Node)
+    
+# 文件名改为 Weighted_Beta_Series_All_Diff
+final_beta_all_output_path <- file.path(output_dir, "Rolling_Regression_Weighted_Beta_Series_All_Diff.csv") # 增加 Diff 标识
+write_csv(final_output_beta_all_wide, final_beta_all_output_path)
+cat(paste0("[SUCCESS] 5/7 滑动窗口回归系数 (Weighted Beta, 所有值, 差分) 序列已保存至: ", final_beta_all_output_path, "\n"))
+
+
+# 6. Beta 序列 (显著 Beta 值) - 针对 Weighted_KRSEI_Diff
+final_output_beta_sig_wide <- final_results %>%
+    mutate(New_Col_Name = paste(Shanshui_Group, Landcover_Name, sep = "_")) %>%
+    select(Time_Node, New_Col_Name, Final_Beta_Significant) %>% 
+    right_join(all_time_nodes, by = "Time_Node") %>%
+    pivot_wider(
+        id_cols = Time_Node, names_from = New_Col_Name, values_from = Final_Beta_Significant, values_fn = max
+    ) %>%
+    arrange(Time_Node)
+    
+# 文件名改为 Weighted_Beta_Series_Significant_Diff
+final_beta_sig_output_path <- file.path(output_dir, "Rolling_Regression_Weighted_Beta_Series_Significant_Diff.csv") # 增加 Diff 标识
+write_csv(final_output_beta_sig_wide, final_beta_sig_output_path)
+cat(paste0("[SUCCESS] 6/7 滑动窗口回归系数 (Weighted Beta, 显著, 差分) 序列已保存至: ", final_beta_sig_output_path, "\n"))
+
+
+# 7. P 值序列
+final_output_pvalue_wide <- final_results %>%
+    mutate(New_Col_Name = paste(Shanshui_Group, Landcover_Name, sep = "_")) %>%
+    select(Time_Node, New_Col_Name, p_value) %>%
+    right_join(all_time_nodes, by = "Time_Node") %>%
+    pivot_wider(
+        id_cols = Time_Node, names_from = New_Col_Name, values_from = p_value, values_fn = max
+    ) %>%
+    arrange(Time_Node)
+    
+final_pvalue_output_path <- file.path(output_dir, "Rolling_Regression_PValue_Series_Diff.csv") # 增加 Diff 标识
+write_csv(final_output_pvalue_wide, final_pvalue_output_path)
+cat(paste0("[SUCCESS] 7/7 滑动窗口 P 值序列 (差分) 已保存至: ", final_pvalue_output_path, "\n"))
+
+
+cat("\n========================================================\n")
