@@ -1,0 +1,152 @@
+// Javacript for GEE
+// This script calculates and exports monthly KNDVI, LST, WET, and NDBSI.
+
+Map.addLayer(roi, {}, 'Study Area');
+Map.centerObject(roi, 6);
+
+/**** 参数设置 ****/
+var startYear = 2011;
+var endYear = 2024;
+var scale = 500;
+var growingSeasonMonths = ee.List.sequence(3, 11);
+
+function clip1000(img) {
+  return img.clip(roi).reproject('EPSG:4326', null, scale);
+}
+
+// KNDVI计算函数
+var addKNDVI_RBF = function(image) {
+  var nir = image.select('sur_refl_b02');
+  var red = image.select('sur_refl_b01');
+  
+  var D2 = nir.subtract(red).pow(2);
+  var sigma = ee.Number(0.15);
+  var k = D2.divide(sigma.pow(2).multiply(2)).multiply(-1).exp();
+  var kndvi = ee.Image.constant(1).subtract(k)
+      .divide(ee.Image.constant(1).add(k));
+  return kndvi.rename('KNDVI');
+}
+
+/**** 月度指标计算 ****/
+function calculateMonthlyIndicators(year, month) {
+  var start = ee.Date.fromYMD(year, month, 1);
+  var end = start.advance(1, 'month');
+
+  var mod09 = ee.ImageCollection('MODIS/061/MOD09A1')
+    .filterDate(start, end)
+    .map(function(img){
+      var qa = img.select('StateQA');
+      var mask = qa.bitwiseAnd(1).eq(0)
+        .and(qa.bitwiseAnd(1<<1).eq(0))
+        .and(qa.bitwiseAnd(1<<10).eq(0));
+      return img.updateMask(mask);
+    });
+
+  var mndwi = mod09.mean().normalizedDifference(['sur_refl_b04','sur_refl_b06']);
+  var waterMask = mndwi.gt(0.2).not();
+
+  var mod09_mean = mod09.mean().multiply(0.0001);
+  var kndvi = addKNDVI_RBF(mod09_mean);
+  kndvi = clip1000(kndvi).updateMask(waterMask);
+
+  var lst = ee.ImageCollection('MODIS/061/MOD11A2')
+    .filterDate(start, end)
+    .map(function(img){
+      var qc = img.select('QC_Day');
+      var mask = qc.bitwiseAnd(3).lt(2);
+      return img.updateMask(mask);
+    })
+    .select('LST_Day_1km').mean().multiply(0.02).subtract(273.15);
+  lst = clip1000(lst).updateMask(waterMask).rename('LST');
+
+  var refl = mod09
+    .select(['sur_refl_b01','sur_refl_b02','sur_refl_b03',
+             'sur_refl_b04','sur_refl_b05','sur_refl_b06','sur_refl_b07'])
+    .mean().multiply(0.0001);
+  refl = clip1000(refl).updateMask(waterMask);
+
+  var wet = refl.expression(
+    '0.1147 * b1 + 0.2489 * b2 + 0.2408 * b3 + 0.3132 * b4 - ' +
+    '0.3122 * b5 - 0.6416 * b6 - 0.5087 * b7', {
+      b1: refl.select('sur_refl_b01'),
+      b2: refl.select('sur_refl_b02'),
+      b3: refl.select('sur_refl_b03'),
+      b4: refl.select('sur_refl_b04'),
+      b5: refl.select('sur_refl_b05'),
+      b6: refl.select('sur_refl_b06'),
+      b7: refl.select('sur_refl_b07')
+    }).rename('WET');
+
+  var red = refl.select('sur_refl_b01');
+  var nir = refl.select('sur_refl_b02');
+  var blue = refl.select('sur_refl_b03');
+  var green = refl.select('sur_refl_b04');
+  var swir1 = refl.select('sur_refl_b06');
+  var si = swir1.add(red).subtract(nir.add(blue))
+                  .divide(swir1.add(red).add(nir).add(blue));
+  var ibi = ee.Image().expression(
+    '(2*S/(S+N) - (N/(N+R) + G/(G+S))) / (2*S/(S+N) + (N/(N+R) + G/(G+S)))',
+    {S: swir1, N: nir, R: red, G: green});
+  var ndbsi = si.add(ibi).divide(2).rename('NDBSI');
+
+  return ee.Image.cat([kndvi, wet, lst, ndbsi])
+    .set('year', year)
+    .set('month', month);
+}
+
+/**** 月度指标集合 ****/
+var monthlyIndicators = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(y){
+    return growingSeasonMonths.map(function(m){
+      return calculateMonthlyIndicators(ee.Number(y), ee.Number(m));
+    });
+  }).flatten()
+);
+
+//---
+//### 导出结果
+//---
+
+//#### 1. 逐月均值表
+
+var monthlyMeanTable = monthlyIndicators.map(function(img){
+  var year = ee.Number(img.get('year'));
+  var month = ee.Number(img.get('month'));
+  var dict = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: scale,
+    maxPixels: 1e13
+  }).set('year', year).set('month', month);
+  return ee.Feature(null, dict);
+});
+print("逐月KNDVI/WET/LST/NDBSI均值表", monthlyMeanTable);
+
+// 导出逐月均值 CSV
+Export.table.toDrive({
+  collection: monthlyMeanTable,
+  description: 'Shanshui_04_Indicators_MonthlyMean_'+startYear+'_'+endYear,
+  folder: 'RSEI_Monthly_Shanshui_04',
+  fileFormat: 'CSV'
+});
+
+//#### 2. 逐月影像
+
+['KNDVI','WET','LST','NDBSI'].forEach(function(ind){
+  var bigImg = monthlyIndicators.select(ind).toBands().rename(
+    ee.List.sequence(startYear, endYear).map(function(y){
+      return growingSeasonMonths.map(function(m){
+        return ee.String(ind).cat('_').cat(ee.Number(y).format('%d')).cat('_').cat(ee.Number(m).format('%02d'));
+      });
+    }).flatten()
+  );
+  Export.image.toDrive({
+    image: bigImg,
+    description: 'Shanshui_04_Indicators_Monthly_'+ind+'_'+startYear+'_'+endYear,
+    folder: 'RSEI_Monthly_Shanshui_04',
+    scale: scale,
+    crs: 'EPSG:4326',
+    region: roi,
+    maxPixels: 1e13
+  });
+});
